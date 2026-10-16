@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import history as history_mod  # noqa: E402
 import inspect  # noqa: E402
+import install  # noqa: E402
 import store  # noqa: E402
 import ui  # noqa: E402
 import themes  # noqa: E402
@@ -74,6 +75,255 @@ class Base(unittest.TestCase):
 
     def read(self, name):
         return json.loads((self.data / f"{name}.json").read_text())
+
+
+class TestWindowsKeyboard(Base):
+    """The Windows keyboard layer, driven through a fake msvcrt.
+
+    It runs on POSIX too: _win_char and _win_read_one look msvcrt up in the
+    module globals at call time, so replacing it here exercises exactly the
+    code path Windows would run, byte for byte."""
+
+    class FakeConsole:
+        """msvcrt with a scripted set of characters and no real console."""
+
+        def __init__(self, chars):
+            self.chars = list(chars)
+
+        def kbhit(self):
+            return bool(self.chars)
+
+        def getwch(self):
+            return self.chars.pop(0)
+
+    def setUp(self):
+        super().setUp()
+        self._real_msvcrt = getattr(tui, "msvcrt", None)
+        self._real_queue = list(tui._WIN_QUEUE)
+        self._real_pending = bytearray(tui._WIN_PENDING)
+        tui._WIN_QUEUE.clear()
+        tui._WIN_PENDING.clear()
+
+    def tearDown(self):
+        if self._real_msvcrt is None:
+            if hasattr(tui, "msvcrt"):
+                del tui.msvcrt
+        else:
+            tui.msvcrt = self._real_msvcrt
+        tui._WIN_QUEUE[:] = self._real_queue
+        tui._WIN_PENDING[:] = self._real_pending
+        super().tearDown()
+
+    def install(self, chars):
+        tui.msvcrt = self.FakeConsole(chars)
+
+    def test_plain_keys_come_out_as_bytes(self):
+        self.install(["a", "\x1b", "[", "A"])
+        self.assertEqual(tui._win_read_one(0), b"a")
+        self.assertEqual(tui._win_read_one(0), b"\x1b")
+        self.assertEqual(tui._win_read_one(0), b"[")
+        self.assertEqual(tui._win_read_one(0), b"A")
+        self.assertIsNone(tui._win_read_one(0))
+
+    def test_multibyte_character_splits_into_utf8_bytes(self):
+        self.install(["é"])
+        self.assertEqual(tui._win_read_one(0), b"\xc3")
+        self.assertEqual(tui._win_read_one(0), b"\xa9")
+        self.assertIsNone(tui._win_read_one(0))
+
+    def test_surrogate_halves_join_into_one_character(self):
+        self.install(["\ud83d", "\ude00"])          # U+1F600, as conhost sends it
+        out = b"".join(tui._win_read_one(0) or b"" for _ in range(4))
+        self.assertEqual(out, "😀".encode("utf-8"))
+        self.assertIsNone(tui._win_read_one(0))
+
+    def test_lone_half_leaves_the_next_key_alone(self):
+        self.install(["\ud800", "k"])
+        self.assertEqual(tui._win_read_one(0), b"?")    # never a fatal encode
+        self.assertEqual(tui._win_read_one(0), b"k")
+
+    def test_nothing_waiting_returns_none(self):
+        self.install([])
+        self.assertIsNone(tui._win_read_one(0))
+        self.assertIsNone(tui._win_char(0))
+
+    def test_read_seq_byte_dispatches_to_the_console_on_windows(self):
+        self.install(["z"])
+        real = tui.WINDOWS
+        tui.WINDOWS = True
+        try:
+            self.assertEqual(tui.read_seq_byte(0, 0), b"z")
+        finally:
+            tui.WINDOWS = real
+
+
+class TestInstallPath(Base):
+    """install.py's PATH handling, string half: append once, never twice.
+
+    Plain text work, so it is checked everywhere even though only Windows
+    needs it. A folder already present in any spelling - quoted, with a
+    trailing slash, or written as a variable - must count as present, or
+    every re-run would stack another copy onto the PATH."""
+
+    def test_missing_folder_is_appended(self):
+        folder = os.path.join("share", "tdash", "bin")
+        current = os.pathsep.join([os.path.join("usr", "bin"), ""])
+        self.assertEqual(install.path_with(folder, current),
+                         os.pathsep.join([os.path.join("usr", "bin"), folder]))
+
+    def test_folder_already_present_changes_nothing(self):
+        folder = os.path.join("share", "tdash", "bin")
+        current = os.pathsep.join([folder, os.path.join("usr", "bin"), ""])
+        self.assertIsNone(install.path_with(folder, current))
+
+    def test_variable_form_counts_as_present(self):
+        os.environ["TDASH_TEST_APPDATA"] = os.path.join("pretend", "appdata")
+        self.addCleanup(os.environ.pop, "TDASH_TEST_APPDATA", None)
+        folder = os.path.join(os.environ["TDASH_TEST_APPDATA"], "tdash", "bin")
+        entry = os.path.join("%TDASH_TEST_APPDATA%", "tdash", "bin")
+        self.assertIsNone(install.path_with(folder, entry))
+
+    def test_empty_path_becomes_the_folder_alone(self):
+        folder = os.path.join("share", "tdash", "bin")
+        self.assertEqual(install.path_with(folder, ""), folder)
+
+
+class FakeWinreg:
+    """Just enough winreg for add_to_user_path - records what was written."""
+
+    HKEY_CURRENT_USER = object()
+    KEY_READ = 0x20019
+    KEY_WRITE = 0x20006
+    REG_SZ = 1
+    REG_EXPAND_SZ = 2
+
+    def __init__(self, values):
+        self.values = values
+        self.wrote = None
+
+    def OpenKey(self, root, name, reserved=0, access=0):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def QueryValueEx(self, key, name):
+        if name not in self.values:
+            raise FileNotFoundError(name)
+        return self.values[name]
+
+    def SetValueEx(self, key, name, reserved, kind, value):
+        self.wrote = (name, kind, value)
+        self.values[name] = (value, kind)
+
+
+class TestInstallRegistry(Base):
+    """add_to_user_path against a fake winreg: right value, right type, once.
+
+    winreg only exists on Windows, so the fake goes into sys.modules; the
+    real function imports it at call time - the same trick the keyboard
+    tests above use for msvcrt - so this runs the code Windows would run."""
+
+    def fake_winreg(self, values):
+        fake = FakeWinreg(values)
+        had, before = "winreg" in sys.modules, sys.modules.get("winreg")
+        sys.modules["winreg"] = fake
+
+        def restore():
+            if had:
+                sys.modules["winreg"] = before
+            else:
+                sys.modules.pop("winreg", None)
+        self.addCleanup(restore)
+        return fake
+
+    def test_missing_folder_is_appended_and_the_type_kept(self):
+        tools = os.path.join("C", "Tools")
+        folder = os.path.join("C", "tdash", "bin")
+        fake = self.fake_winreg({"Path": (tools, FakeWinreg.REG_SZ)})
+        self.assertTrue(install.add_to_user_path(folder))
+        self.assertEqual(fake.wrote,
+                         ("Path", FakeWinreg.REG_SZ, os.pathsep.join([tools, folder])))
+
+    def test_folder_already_present_writes_nothing(self):
+        folder = os.path.join("C", "tdash", "bin")
+        fake = self.fake_winreg({"Path": (folder, FakeWinreg.REG_EXPAND_SZ)})
+        self.assertFalse(install.add_to_user_path(folder))
+        self.assertIsNone(fake.wrote)
+
+    def test_missing_path_value_starts_one(self):
+        folder = os.path.join("C", "tdash", "bin")
+        fake = self.fake_winreg({})
+        self.assertTrue(install.add_to_user_path(folder))
+        self.assertEqual(fake.wrote, ("Path", FakeWinreg.REG_EXPAND_SZ, folder))
+
+
+class TestInstallCopy(Base):
+    """install_into: the program goes to its own folder, data is kept.
+
+    Everything happens in temp folders, so the copy rules - what is copied,
+    what is skipped, what a second run leaves alone - are checked on any
+    platform. This is what lets the folder someone ran install.py from be
+    moved or deleted afterwards."""
+
+    def setUp(self):
+        super().setUp()
+        self.source = Path(TMP) / "downloads" / "tdash"
+        self.target = Path(TMP) / "install" / "app"
+        self.source.mkdir(parents=True)
+        for name in ("dashboard.py", "tdash.py", "store.py"):
+            (self.source / name).write_text(f"# {name}")
+        (self.source / ".venv" / "bin").mkdir(parents=True)
+        (self.source / ".venv" / "bin" / "python").write_text("old venv")
+        (self.source / "__pycache__").mkdir()
+        (self.source / "__pycache__" / "stale.pyc").write_bytes(b"x")
+
+    def test_first_install_copies_program_venv_and_data(self):
+        (self.source / "data").mkdir()
+        (self.source / "data" / "projects.json").write_text('{"mine": 1}')
+        files, venv, data = install.install_into(self.source, self.target)
+        self.assertEqual((files, venv, data), (3, True, True))
+        self.assertEqual((self.target / "tdash.py").read_text(), "# tdash.py")
+        self.assertEqual((self.target / ".venv" / "bin" / "python").read_text(),
+                         "old venv")
+        self.assertEqual((self.target / "data" / "projects.json").read_text(),
+                         '{"mine": 1}')
+        self.assertFalse((self.target / "__pycache__").exists())
+
+    def test_second_install_refreshes_code_but_keeps_venv_and_data(self):
+        (self.source / "data").mkdir()
+        (self.source / "data" / "projects.json").write_text('{"old": 1}')
+        install.install_into(self.source, self.target)
+        # Progress made after the install, on the installed copy.
+        (self.target / "data" / "projects.json").write_text('{"new": 1}')
+        (self.target / ".venv" / "bin" / "python").write_text("kept venv")
+        (self.source / "dashboard.py").write_text("# dashboard, updated")
+        files, venv, data = install.install_into(self.source, self.target)
+        self.assertEqual(files, 3)
+        self.assertFalse(venv)
+        self.assertFalse(data)
+        self.assertEqual((self.target / "dashboard.py").read_text(),
+                         "# dashboard, updated")
+        self.assertEqual((self.target / "data" / "projects.json").read_text(),
+                         '{"new": 1}')
+        self.assertEqual((self.target / ".venv" / "bin" / "python").read_text(),
+                         "kept venv")
+
+    def test_installing_where_it_already_is_copies_nothing(self):
+        self.assertEqual(install.install_into(self.source, self.source),
+                         (0, False, False))
+
+    def test_launcher_text_points_at_the_installed_copy(self):
+        launcher = Path(TMP) / "bin" / "tdash"
+        launcher.parent.mkdir()
+        python = self.target / ".venv" / "bin" / "python"
+        install.write_launcher(launcher, python, self.target / "tdash.py")
+        text = launcher.read_text()
+        self.assertIn(str(self.target / "tdash.py"), text)
+        self.assertIn(str(python), text)
 
 
 class TestProjects(Base):
@@ -140,9 +390,27 @@ class TestDemo(Base):
         self.assertIn("example project", tour["notes"])
 
     def test_the_finished_machine_is_marked_and_dated(self):
+        """Dated today at seeding time, so a first run's Summary opens on a
+        completed-today row instead of the recent-wins fallback."""
         web = store.find_machine_by_name(self.key, "Web Box")
         self.assertEqual(web["completed"], 1)
-        self.assertEqual(web["completed_on"], "2026-01-15")
+        self.assertEqual(web["completed_on"], store.today_iso())
+        self.assertIn(web["id"],
+                      [m["id"] for m in store.completed_today(self.key)])
+
+    def test_the_example_reads_as_an_active_project(self):
+        """Hours on the clock and days actually left: the Stats panel should
+        not open on zeroes, and the deadline should never be in the past,
+        however long the demo has been sitting around."""
+        self.assertEqual(store.stats(self.key)["hours_studied"], 12)
+        self.assertEqual(store.days_left(self.key), 42)
+
+    def test_the_repository_covers_its_two_groups(self):
+        items = store.repository_items(self.key)
+        self.assertEqual([i["group"] for i in items],
+                         ["Commands", "Commands", "Write-ups"])
+        self.assertTrue(all(i["body"] for i in items),
+                        "a demo entry without details teaches nothing")
 
     def test_the_override_reads_as_the_machines_own(self):
         ad = store.find_machine_by_name(self.key, "AD Box")
@@ -3867,6 +4135,60 @@ class TestMouseAndScrolling(Base):
                 continue
             self.assertIsNone(tui._mouse_event(report))
 
+    def _stdin_on(self, fd):
+        class FakeStdin:
+            def fileno(self):
+                return fd
+
+            def isatty(self):
+                return True
+
+        return FakeStdin()
+
+    def _read_written(self, keys, timeout=0.2):
+        """Feed raw bytes through the real read_key, like a terminal would."""
+        import os
+        real_stdin, real_pushed = sys.stdin, tui._PUSHED
+        r, w = os.pipe()
+        sys.stdin = self._stdin_on(r)
+        tui._PUSHED = b""
+        try:
+            os.write(w, keys)
+            return tui.read_key(timeout)
+        finally:
+            sys.stdin, tui._PUSHED = real_stdin, real_pushed
+            os.close(r)
+            os.close(w)
+
+    def test_the_reports_ask_for_the_wheel_only(self):
+        """No motion tracking: nothing here uses pointer movement, and a
+        console answers motion modes with a report per movement. Each ignored
+        report used to cost the caller a repaint, so on Windows the wheel
+        lagged seconds behind the pointer."""
+        self.assertIn("?1000h", tui.MOUSE_ON)
+        self.assertIn("?1006h", tui.MOUSE_ON)
+        self.assertNotIn("?1002h", tui.MOUSE_ON)
+        self.assertNotIn("?1003h", tui.MOUSE_ON)
+        for mode in ("1000", "1002", "1003", "1006"):
+            self.assertIn(f"?{mode}l", tui.MOUSE_OFF,
+                          "the reset must clear every mode an earlier version set")
+
+    def test_ignored_reports_do_not_wake_the_caller(self):
+        """A click press and release are swallowed inside read_key: it keeps
+        waiting, and the wheel behind them still arrives as one clean key.
+        Handing None back for each would repaint the screen per report."""
+        key = self._read_written(b"\x1b[<0;10;5M\x1b[<0;10;5m\x1b[<64;10;5M")
+        self.assertIs(key, tui.KEY_WHEEL_UP)
+
+    def test_an_endless_flood_still_times_out(self):
+        """A pointer that keeps moving cannot stall a screen for ever: the
+        wait ends on its own deadline exactly as an idle one does."""
+        import time
+        start = time.monotonic()
+        key = self._read_written(b"\x1b[<35;1;1M" * 500, timeout=0.05)
+        self.assertIsNone(key)
+        self.assertLess(time.monotonic() - start, 2.0)
+
     def test_a_malformed_report_does_not_crash(self):
         for junk in (b"<", b"<zz", b"<>", b""):
             self.assertIsNone(tui._mouse_event(junk))
@@ -4796,9 +5118,11 @@ class TestThemes(Base):
         self.assertEqual(len(themes.choices()), len(themes.ORDER))
 
     def test_the_leading_themes_come_first(self):
-        self.assertEqual(themes.ORDER[:2], ["jade", "teal"])
+        self.assertEqual(themes.ORDER[:2], ["teal", "jade"])
         self.assertEqual([label for label, _ in themes.choices()[:2]],
-                         ["Jade", "Teal"])
+                         ["Teal", "Jade"])
+        self.assertEqual(themes.ORDER[0], themes.DEFAULT_THEME,
+                         "the picker leads with the theme a new project gets")
 
     def test_a_retired_theme_name_keeps_its_look(self):
         """A project that picked an old name got its palette; heal points it

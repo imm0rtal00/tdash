@@ -2,14 +2,33 @@
 
 import base64
 import os
-import select
 import shutil
 import subprocess
 import sys
 import time
-import termios
-import tty
 from contextlib import contextmanager
+
+# The keyboard layer is the one part of this file that differs by platform: a
+# POSIX terminal hands over raw bytes (select/os.read, termios for the mode),
+# while a Windows console hands over whole characters (msvcrt) and takes its
+# mode through kernel32. Everything else - the escape parser, paste assembly,
+# every picker - consumes the byte stream both layers produce.
+WINDOWS = os.name == "nt"
+
+if WINDOWS:
+    import ctypes
+    import msvcrt
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.GetStdHandle.restype = ctypes.c_void_p
+    _kernel32.GetStdHandle.argtypes = [ctypes.c_ulong]
+    _kernel32.GetConsoleMode.argtypes = [ctypes.c_void_p,
+                                         ctypes.POINTER(ctypes.c_ulong)]
+    _kernel32.SetConsoleMode.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+else:
+    import select
+    import termios
+    import tty
 
 from rich.console import Group
 from rich.panel import Panel
@@ -109,7 +128,12 @@ LIST_MAX = 5
 PICKER_CHROME = 4
 
 
-MOUSE_ON = "\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h"
+# Ask for what is actually used: button press/release and the wheel (1000),
+# in SGR coordinates (1006). Modes 1002 and 1003 ask for pointer motion, and
+# a console answers those with a report per movement; conhost especially
+# turns that into a flood, which left the wheel seconds behind the pointer.
+MOUSE_ON = "\x1b[?1000h\x1b[?1006h"
+# The reset clears every tracking mode an earlier version may have asked for.
 MOUSE_OFF = "\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l"
 # Bracketed paste tells the terminal to wrap pasted text in ESC[200~ / ESC[201~.
 # Without asking for it you are at the terminal's mercy: some send the markers,
@@ -144,10 +168,76 @@ def write_escape(seq):
         pass
 
 
+# SetConsoleMode bits, named the way the termios code below names its own.
+STD_INPUT_HANDLE = -10
+STD_OUTPUT_HANDLE = -11
+ENABLE_PROCESSED_INPUT = 0x0001
+ENABLE_LINE_INPUT = 0x0002
+ENABLE_ECHO_INPUT = 0x0004
+ENABLE_QUICK_EDIT_MODE = 0x0040
+ENABLE_EXTENDED_FLAGS = 0x0080
+ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
+ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+
+
+def _console_mode(handle):
+    """A console handle's mode bits, or None when it is not a console."""
+    mode = ctypes.c_ulong()
+    if _kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+        return mode.value
+    return None
+
+
+def _set_console_mode(handle, mode):
+    return bool(_kernel32.SetConsoleMode(handle, mode))
+
+
+@contextmanager
+def _raw_mode_windows():
+    """raw_mode for a Windows console: console modes in place of termios."""
+    stdin_handle = _kernel32.GetStdHandle(STD_INPUT_HANDLE)
+    stdout_handle = _kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+    old_in = _console_mode(stdin_handle)
+    if old_in is None:
+        raise SystemExit("tdash needs a console to read keys from.")
+    # Keys one at a time, no echo, no line editing, Ctrl+C delivered as the
+    # \x03 byte rather than as a signal - cbreak plus cleared ISIG on POSIX.
+    # ENABLE_EXTENDED_FLAGS must be set for the quick-edit bit to be observed
+    # at all, and quick-edit off keeps a stray click from parking the console
+    # in text selection until Enter.
+    new_in = old_in & ~(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT
+                        | ENABLE_PROCESSED_INPUT | ENABLE_QUICK_EDIT_MODE)
+    new_in |= ENABLE_EXTENDED_FLAGS | ENABLE_VIRTUAL_TERMINAL_INPUT
+    if not _set_console_mode(stdin_handle, new_in):
+        raise SystemExit(
+            "This console cannot do virtual-terminal input. Run tdash in "
+            "Windows Terminal (or any console on Windows 10 1809+).")
+    # The mouse and paste sequences this app writes are escape sequences, so
+    # the console has to interpret them rather than print them out.
+    old_out = _console_mode(stdout_handle)
+    if old_out is not None:
+        _set_console_mode(stdout_handle,
+                          old_out | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+    try:
+        write_escape(MOUSE_ON)
+        write_escape(PASTE_ON)
+        yield
+    finally:
+        write_escape(PASTE_OFF)
+        write_escape(MOUSE_OFF)
+        _set_console_mode(stdin_handle, old_in)
+        if old_out is not None:
+            _set_console_mode(stdout_handle, old_out)
+
+
 @contextmanager
 def raw_mode():
     if not sys.stdin.isatty():
         yield
+        return
+    if WINDOWS:
+        with _raw_mode_windows():
+            yield
         return
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
@@ -173,7 +263,57 @@ def raw_mode():
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
+# Characters the Windows console has handed over but not yet consumed, and
+# the bytes of the current character still being handed out. Callers expect
+# one byte per read the way os.read(fd, 1) behaves, so a character that
+# encodes to several UTF-8 bytes is served a byte at a time.
+_WIN_QUEUE = []
+_WIN_PENDING = bytearray()
+
+
+def _win_char(timeout):
+    """One character from the console, or None if none arrives within timeout.
+
+    msvcrt has no select: kbhit() is the whole readiness story, so the wait
+    is a poll. A character outside the basic plane arrives as two UTF-16
+    halves, stitched back together here."""
+    if _WIN_QUEUE:
+        return _WIN_QUEUE.pop(0)
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while True:
+        if msvcrt.kbhit():
+            char = msvcrt.getwch()
+            if "\ud800" <= char <= "\udbff":
+                low = _win_char(0.05)
+                if low is None:
+                    return char
+                if "\udc00" <= low <= "\udfff":
+                    return chr(0x10000 + ((ord(char) - 0xD800) << 10)
+                               + (ord(low) - 0xDC00))
+                _WIN_QUEUE.append(low)      # not a pair after all
+                return char
+            return char
+        if deadline is not None and time.monotonic() >= deadline:
+            return None
+        time.sleep(0.005)
+
+
+def _win_read_one(timeout):
+    """One byte of Windows console input, or None if none arrives in time."""
+    if not _WIN_PENDING:
+        char = _win_char(timeout)
+        if char is None:
+            return None
+        _WIN_PENDING.extend(char.encode("utf-8", "replace"))
+    byte = _WIN_PENDING[0]
+    del _WIN_PENDING[0]
+    return bytes((byte,))
+
+
 def read_seq_byte(fd, timeout):
+    """One byte from the keyboard layer, or None if none arrives in time."""
+    if WINDOWS:
+        return _win_read_one(timeout)
     ready, _, _ = select.select([fd], [], [], timeout)
     if not ready:
         return None
@@ -246,10 +386,9 @@ def drain_escape(fd):
     consumed and ignored. Consuming the whole sequence matters: leaving a stray
     byte behind would have it read as the next keystroke.
     """
-    ready, _, _ = select.select([fd], [], [], 0)
-    if not ready:
+    nxt = read_seq_byte(fd, 0)
+    if nxt is None:
         return "\x1b"
-    nxt = read_seq_byte(fd, 0.05)
     if nxt in (b"\r", b"\n"):
         return SHIFT_ENTER          # ESC then Enter: how some terminals send it
     if nxt in (b"\x7f", b"\x08"):
@@ -338,26 +477,31 @@ def read_key(timeout=None):
             return sys.stdin.read(1) or None
         except (InterruptedError, OSError):
             return None
+    deadline = None if timeout is None else time.monotonic() + timeout
     global _PUSHED
-    if _PUSHED:
-        # A byte a sequence read decided belonged to the next key.
-        char, _PUSHED = _PUSHED[:1], _PUSHED[1:]
-    else:
-        ready, _, _ = select.select([fd], [], [], timeout)
-        if not ready:
-            return None
-        while True:
-            try:
-                char = os.read(fd, 1)
-                break
-            except InterruptedError:
-                continue
-            except OSError:
+    while True:
+        if _PUSHED:
+            # A byte a sequence read decided belonged to the next key.
+            char, _PUSHED = _PUSHED[:1], _PUSHED[1:]
+        else:
+            wait = None if deadline is None else max(0.0, deadline - time.monotonic())
+            char = read_seq_byte(fd, wait)
+            if char is None:
                 return None
-        if not char:
-            return None
-    key = char.decode("utf-8", "replace")
-    if key != "\x1b":
+        key = char.decode("utf-8", "replace")
+        if key == "\x1b":
+            key = drain_escape(fd)
+            if key is None:
+                # A complete sequence nobody acts on: a mouse press or release,
+                # a drag, a function key that maps to nothing. Swallowed here,
+                # and the wait continues. Handing None back instead made the
+                # caller repaint the screen once per report, and conhost sends
+                # those in floods while the pointer moves - which is what left
+                # the wheel answering seconds late.
+                if deadline is not None and time.monotonic() >= deadline:
+                    return None
+                continue
+            return key
         # ctrl+x u / r / q is resolved here so every screen gets it, including
         # pickers and editors that read keys directly. ctrl+x on its own is
         # swallowed rather than passed on: left as a raw \x18 it would be typed
@@ -366,7 +510,6 @@ def read_key(timeout=None):
             read_chord(key)
             return None
         return key
-    return drain_escape(fd)
 
 
 def list_view(limit=None):

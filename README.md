@@ -11,8 +11,11 @@ Plain Python, `rich` for the interface, JSON for storage. One dependency.
 
 - A terminal. Any modern one works: the interface uses colours and box-drawing
   characters, and needs a font with box-drawing glyphs (most default fonts).
-- Python 3.8+. Written and tested against 3.13; no syntax newer than 3.8 is
-  used, so treat 3.8+ as expected rather than proven.
+  On Windows, use Windows Terminal or the built-in console (Windows 10 1809+
+  or Windows 11); an older console gets a message saying so instead of a
+  broken screen.
+- Python 3.8+. Written and tested against 3.13 on Linux and Windows; no syntax
+  newer than 3.8 is used, so treat 3.8+ as expected rather than proven.
 - `rich`, the single dependency. `setup.py` installs it into a `.venv` for you.
 
 Sized for 80×24 and up. Smaller terminals adapt rather than break: the menu
@@ -21,37 +24,57 @@ menu, and the Help text pages itself.
 
 ## Install
 
-Copy the folder anywhere, then:
+Unzip the folder anywhere, then:
 
 ```sh
-cd <the folder containing tdash>
-python setup.py      # creates .venv/ and installs rich
-python install.py    # adds the tdash command to your PATH
+cd <the folder you unzipped>
+python setup.py      # once: creates .venv/ and installs rich
+python install.py    # installs the app and the tdash command
 ```
 
-If `python` is not found but `python3` is, use that. `setup.py` is safe to
-re-run any time.
+If `python` is not found but `python3` is, use that.
 
-`install.py` writes a small launcher script (not a symlink, so it survives
-zipping, copying and Windows checkouts) into `~/.local/bin`, or
-`%LOCALAPPDATA%\tdash\bin` on Windows. Add that folder to your PATH if `tdash`
-is not found. **If you move or rename the project, run `python install.py`
-again.**
+`install.py` copies the program into a per-user folder
+(`~/.local/share/tdash/app` on Linux and macOS, `%LOCALAPPDATA%\tdash\app` on
+Windows) and writes a small launcher next to it (not a symlink, so it survives
+zipping, copying and Windows checkouts): `~/.local/bin/tdash`, or
+`%LOCALAPPDATA%\tdash\bin\tdash.cmd` on Windows. On Windows it also adds that
+folder to your PATH itself — no admin rights, no System Properties walk. On
+Linux, add `~/.local/bin` to your PATH if `tdash` is not found (most
+distributions already have it).
+
+**The folder you installed from is now disposable**: delete it, move it, keep
+it. The app runs from the installed copy, and your data lives with it
+(`…/tdash/app/data`), not in the download.
+
+To **upgrade**, run `python install.py` from a newer copy: the installed
+virtualenv and your data are kept. `setup.py` is only needed the first time.
+
+Open a new terminal — command shells only re-read PATH at start — then:
+
+```sh
+tdash
+```
 
 ### Running without installing
 
 ```sh
-./tdash                # Linux, macOS, WSL
-python tdash.py        # anywhere, including Windows
+./tdash                # Linux, macOS, WSL; runs from the folder
+python tdash.py        # from the folder, including Windows
 ```
+
+This runs the copy in the folder, with its own `data/` beside it — handy for a
+look around before installing.
 
 ## First run: the demo project
 
-The first run creates **Demo Project**, an example with every screen filled
-in, and opens on it. The notes of its first machine, `Start Here`, are a short
-tour, and the rest of it shows the features off: a group per platform, one box
-already finished, one category answered for a single machine only (its page
-carries a `*`), and a repository entry.
+The first run creates **Demo Project**, an example with every screen filled in,
+and opens on it. The notes of its first machine, `Start Here`, are a short
+tour, and the rest shows the features off: a group per platform, one box
+already finished — dated today, so the Summary opens on a win — one category
+answered for a single machine only (its page carries a `*`), twelve hours on
+the clock with a deadline six weeks out, and a repository with entries under
+two headings.
 
 When you have looked around, make it yours:
 
@@ -181,7 +204,7 @@ Seven entries, each one press away from its change:
 | Next | which machine is next |
 | Hours | study hours so far |
 | Deadline | the date the days-left counter counts to |
-| Themes | the project's colour theme — twenty-one of them, starting with `jade` and `teal` |
+| Themes | the project's colour theme — twenty-one of them, starting with `teal`, the default, and `jade` |
 | Reset | clears the project's progress and hours (asks first) |
 
 Everything here belongs to the project, so another project keeps its own.
@@ -270,8 +293,10 @@ project's own key: theme, objective, panel name, deadline, hours, machines,
 categories, repository and the current/next slots. Nothing you do in one
 project affects another.
 
-Data sits in `data/` beside the app as plain JSON you can read, back up and
-edit:
+Data sits in `data/` beside the copy you are running — the unzipped folder
+when you run from it, the installed copy (`~/.local/share/tdash/app/data`, or
+`%LOCALAPPDATA%\tdash\app\data`) when you installed — as plain JSON you can
+read, back up and edit:
 
 | file | holds |
 | --- | --- |
@@ -316,7 +341,7 @@ tdash machine add "Box 1" --notes "found the way in"
 tdash machine mark "Box 1"                        # also: unmark, remove
 tdash repository add Kerberos --details "tickets, delegation"
 tdash hours 2                                     # negative subtracts
-tdash themes jade
+tdash themes teal
 tdash help
 ```
 
@@ -330,15 +355,43 @@ Runs against a temporary data directory, never your real progress.
 
 ## Moving to another machine
 
-Copy the whole folder — the source files and your `data/` — then run
-`python setup.py` and `python install.py` on the new machine. There are no
-absolute paths and no state kept anywhere else; your data is JSON.
+Take your `data/` folder — from the unzipped folder or from the installed
+copy. On the new machine: unzip tdash, run `python setup.py` and
+`python install.py`, then copy your `data/` over the new copy's `data/`
+(`…/tdash/app/data` if you installed). There are no absolute paths and no
+state kept anywhere else; your data is JSON.
 
 ## Windows
 
-`python setup.py` then `python install.py`, as above; `tdash.cmd` is written
-next to the install folder. Until it is on your PATH, `python tdash.py` runs
-the app directly, no shell wrapper needed.
+Everything above works in Windows Terminal or the built-in console (`cmd.exe`)
+on Windows 10 1809+ and Windows 11. From a fresh machine, in `cmd.exe`:
+
+```cmd
+winget install -e --id Python.Python.3.13
+```
+
+Or install Python from python.org and tick **Add python.exe to PATH** in the
+installer. Open a new terminal so `python` is picked up, then:
+
+```cmd
+cd <the folder you unzipped>
+python setup.py
+python install.py
+```
+
+Open another new terminal and run `tdash`. `install.py` puts the launcher in
+`%LOCALAPPDATA%\tdash\bin` and adds that folder to your PATH by itself, so no
+admin rights and no System Properties walk are needed. If a brand-new terminal
+still cannot find `tdash`, sign out and back in once — Windows caches the
+environment — or run `%LOCALAPPDATA%\tdash\bin\tdash.cmd` directly.
+
+If `python` opens the Microsoft Store or is not found after installing, the
+Store's *App execution aliases* are in the way: switch the `python.exe`
+aliases off under **Settings → Apps → Advanced app settings → App execution
+aliases**.
+
+The folder you unzipped can be deleted afterwards; the app runs from
+`%LOCALAPPDATA%\tdash\app` and keeps its data in `%LOCALAPPDATA%\tdash\app\data`.
 
 ## License
 

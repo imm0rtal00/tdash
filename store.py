@@ -21,7 +21,7 @@ import re
 import shutil
 import stat
 import time
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 from history import History
@@ -1468,16 +1468,17 @@ DEMO_KEY = "demo"
 DEMO_OBJECTIVE = ("A guided tour of tdash \u2014 delete this project when "
                   "you are done")
 
-DEMO_TOUR = """Welcome. This is an example project: every screen has something in it, and these notes are the tour. Start a project of your own when you have looked around, then delete this one from the Project menu.
+DEMO_TOUR = """Welcome. This is an example project: every screen has something in it, and these notes are the tour. Start one of your own when you have looked around, then delete this one from [1] Project.
 
-The menu at the top lists the screens and the key that opens each; every screen also prints what its own keys do along the bottom, so nothing here needs remembering. Enter opens whatever the cursor is on, Esc goes back, and Help explains the rest.
+The menu at the top opens every screen, and each screen prints its own keys along the bottom, so little here has to be remembered. Enter opens whatever the cursor is on, Esc goes back one level, and [5] Help explains the rest.
 
 A few things to try:
-  - Machines, then Enter on this one: a machine's page, with its fields and its notes. On the list, m marks a machine complete and c opens the categories a machine uses.
-  - Summary: the whole project in one table.
-  - Repository: a place for the commands and write-ups worth keeping.
+  - [2] Machines, then Enter on this one: a machine reads as pages - its description in the box above, then its notes, then every field it uses. On the list, m marks a machine finished, c picks the fields a machine uses, and a adds one.
+  - [3] Repository: the commands and write-ups worth keeping, filed under headings.
+  - [4] Settings: the hours on the clock (this project starts with 12), the deadline the days-left counter counts to, and Themes - twenty-one of them, Teal by default.
+  - [6] Summary: the finished machines and their notes. "Completed Today" reads 1 because Web Box is dated today on purpose; a first run should not open on an empty tracker.
 
-Machines are sorted by the group you give them, under a heading per group; leave the group empty and a machine lands in the Ungrouped section at the end, like this one and "Loose End"."""
+Machines are sorted under a heading per group; leave the group empty and a machine lands in the Ungrouped section, like this one and "Loose End". ctrl+x u undoes anything, ctrl+x q quits, and [5] Help has the rest of the keys."""
 
 
 def _seed_demo():
@@ -1505,25 +1506,30 @@ def _seed_demo():
     start = machine("m1", "Start Here", notes=DEMO_TOUR,
                     description="Read this first: the notes are a short tour.")
     web = machine("m2", "Web Box", group="Web",
-                  description="A finished machine, so a complete row has "
-                              "something to show.",
-                  notes="Marked off with m on the machines list: the tick and "
-                        "the date are all the record there is. The date here "
-                        "is an example.",
+                  description="A finished machine, so the tick, the date and "
+                              "the Summary have something to show.",
+                  notes="The tick and the date are the whole record of a "
+                        "finished machine: m on the machines list marks it, "
+                        "and m again takes it back. This one is dated today "
+                        "on purpose, so the Summary opens with something in "
+                        "it.",
                   categories={"f1": None, "f2": None},
-                  completed=1, completed_on="2026-01-15")
+                  completed=1, completed_on=today_iso())
     ad = machine("m3", "AD Box", group="Windows",
-                 description="Still going - it and Loose End are this "
-                             "project's current and next.",
+                 description="Still going, and this project's Current - see "
+                             "the Status panel up top.",
                  notes="Its Credentials line is answered for this machine "
                        "alone; the star on the machine's page marks an answer "
-                       "that is not the shared default.",
+                       "that is not the shared default. Current and Next are "
+                       "set under [4] Settings.",
                  categories={"f1": "svc_backup:try-me", "f2": None})
     loose = machine("m4", "Loose End",
                     description="A machine with no group, so it sits on its "
-                                "own.",
-                    notes="Give a machine a group to sort it under a heading "
-                          "in the list.")
+                                "own at the end of the list.",
+                    notes="This one is the project's Next, waiting behind AD "
+                          "Box, and its Ticket line shows a field answered "
+                          "for one machine alone.",
+                    categories={"f2": "LAB-1042"})
     board = {"current": "m3", "next": "m4",
              "items": [start, web, ad, loose],
              "categories": [
@@ -1532,9 +1538,22 @@ def _seed_demo():
                  {"id": "f2", "title": "Ticket", "default": "", "group": ""}]}
     save("machines", {"projects": {DEMO_KEY: board}}, record=False)
     save("repository", {"projects": {DEMO_KEY: {"items": [
-        {"id": "r1", "title": "Keep the commands that worked",
-         "body": "nmap -sC -sV -oA scan <ip>", "group": ""}]}}}, record=False)
-    save("progress", {"projects": {DEMO_KEY: new_stats()}}, record=False)
+        {"id": "r1", "title": "Recon first",
+         "body": "nmap -sC -sV -p- -oA scan <ip>", "group": "Commands"},
+        {"id": "r2", "title": "Web fuzzing",
+         "body": "ffuf -w seclists/Discovery/Web-Content/raft-small-words.txt "
+                 "-u http://<ip>/FUZZ", "group": "Commands"},
+        {"id": "r3", "title": "Write-ups belong here too",
+         "body": "Keep the paragraph that says what worked, and why, next to "
+                 "the commands: the box after this one reads faster.",
+         "group": "Write-ups"}]}}}, record=False)
+    stats = new_stats()
+    stats["hours_studied"] = 12
+    # Six weeks out, counted from the day of seeding: a first run should show
+    # days actually left, however long the demo has been sitting around.
+    stats["deadline"] = (date.fromisoformat(today_iso())
+                         + timedelta(days=42)).isoformat()
+    save("progress", {"projects": {DEMO_KEY: stats}}, record=False)
     return ["An example project has been created - look around, then delete "
             "it and make one of your own"]
 

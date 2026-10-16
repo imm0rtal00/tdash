@@ -45,11 +45,11 @@ THEMES = {
     "gold":       {"label": "Gold",       "accent": "gold1",             "bright": "bright_yellow"},
 }
 
-DEFAULT_THEME = "jade"
+DEFAULT_THEME = "teal"
 
-# Picker order, which is also the menu number for each theme: greens, then
-# teals and blues, then purples, pinks, reds, oranges and yellows.
-ORDER = ["jade", "teal", "mint", "forest", "pine", "moss",
+# Picker order, which is also the menu number for each theme: the default
+# first, then greens, blues, purples, pinks, reds, oranges and yellows.
+ORDER = ["teal", "jade", "mint", "forest", "pine", "moss",
          "cobalt", "cornflower", "royal", "lavender", "violet", "rose",
          "raspberry", "blossom", "coral", "red", "garnet",
          "tangerine", "apricot", "bronze", "gold"]
