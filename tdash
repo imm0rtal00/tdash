@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+
+# Launch tdash (short name).
+# A real file, not a symlink to another launcher in this folder: symlinks break
+# when the project is zipped, copied to another machine, or checked out on
+# Windows.
+
+REAL_SCRIPT="$(readlink -f "$0")"
+SCRIPT_DIR="$(dirname "$REAL_SCRIPT")"
+
+PYTHON="${PYTHON:-python3}"
+
+exec "$PYTHON" "$SCRIPT_DIR/tdash.py" "$@"

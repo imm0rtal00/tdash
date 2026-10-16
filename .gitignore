@@ -1,0 +1,19 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
+# Virtualenv (recreate with: python setup.py)
+.venv/
+venv/
+
+# Test and editor leftovers
+.pytest_cache/
+.mypy_cache/
+
+# Atomic-write temporaries
+*.tmp
+
+# Your study data - created on first run, and yours alone.
+# The app recreates everything here from scratch (including the demo
+# project), so a clone without it works exactly the same.
+data/
